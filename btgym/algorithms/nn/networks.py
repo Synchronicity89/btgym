@@ -27,6 +27,7 @@ def conv_2d_network(x,
                     name='conv2d',
                     collections=None,
                     reuse=False,
+                    keep_prob=None,
                     **kwargs):
     """
     Stage1 network: from preprocessed 2D input to estimated features.
@@ -36,7 +37,6 @@ def conv_2d_network(x,
         tensor holding state features;
     """
     with tf.variable_scope(name, reuse=reuse):
-        #for i in range(conv_2d_num_layers):
         for i, num_filters in enumerate(conv_2d_num_filters):
             x = tf.nn.elu(
                 norm_layer(
@@ -51,15 +51,18 @@ def conv_2d_network(x,
                         collections,
                         reuse
                     ),
-                    scope=name + "_layer_{}".format(i + 1)
+                    scope=name + "_norm_layer_{}".format(i + 1)
                 )
             )
+            if keep_prob is not None:
+                x = tf.nn.dropout(x, keep_prob=keep_prob, name="_layer_{}_with_dropout".format(i + 1))
+
         # A3c/BaseAAC original paper design:
-        #x = tf.nn.elu(conv2d(x, 16, 'conv2d_1', [8, 8], [4, 4], pad, dtype, collections, reuse))
-        #x = tf.nn.elu(conv2d(x, 32, 'conv2d_2', [4, 4], [2, 2], pad, dtype, collections, reuse))
-        #x = tf.nn.elu(
+        # x = tf.nn.elu(conv2d(x, 16, 'conv2d_1', [8, 8], [4, 4], pad, dtype, collections, reuse))
+        # x = tf.nn.elu(conv2d(x, 32, 'conv2d_2', [4, 4], [2, 2], pad, dtype, collections, reuse))
+        # x = tf.nn.elu(
         #   linear(batch_flatten(x), 256, 'conv_2d_dense', normalized_columns_initializer(0.01), reuse=reuse)
-        #)
+        # )
         return x
 
 
@@ -73,7 +76,8 @@ def conv_1d_network(x,
                     pad="SAME",
                     dtype=tf.float32,
                     collections=None,
-                    reuse=False):
+                    reuse=False,
+                    **kwargs):
     """
     Stage1 network: from preprocessed 1D input to estimated features.
     Encapsulates convolutions, [possibly] skip-connections etc. Can be shared.
@@ -103,6 +107,8 @@ def lstm_network(
         lstm_sequence_length,
         lstm_class=rnn.BasicLSTMCell,
         lstm_layers=(256,),
+        static=False,
+        keep_prob=None,
         name='lstm',
         reuse=False,
         **kwargs
@@ -118,15 +124,22 @@ def lstm_network(
          lstm flattened feed placeholders as tuple.
     """
     with tf.variable_scope(name, reuse=reuse):
-        # Flatten, add action/reward and expand with fake [time] batch? dim to feed LSTM bank:
-        #x = tf.concat([x, a_r] ,axis=-1)
-        #x = tf.concat([batch_flatten(x), a_r], axis=-1)
-        #x = tf.expand_dims(x, [0])
+        # Prepare rnn type:
+        if static:
+            rnn_net = tf.nn.static_rnn
+            # Remove time dimension (suppose always get one) and wrap to list:
+            x = [x[:, 0, :]]
 
+        else:
+            rnn_net = tf.nn.dynamic_rnn
         # Define LSTM layers:
         lstm = []
         for size in lstm_layers:
-            lstm += [lstm_class(size)] #, state_is_tuple=True)]
+            layer = lstm_class(size)
+            if keep_prob is not None:
+                layer = tf.nn.rnn_cell.DropoutWrapper(layer, output_keep_prob=keep_prob)
+
+            lstm.append(layer)
 
         lstm = rnn.MultiRNNCell(lstm, state_is_tuple=True)
         # Get time_dimension as [1]-shaped tensor:
@@ -137,33 +150,45 @@ def lstm_network(
         lstm_state_pl = rnn_placeholders(lstm.zero_state(1, dtype=tf.float32))
         lstm_state_pl_flatten = flatten_nested(lstm_state_pl)
 
-        lstm_outputs, lstm_state_out = tf.nn.dynamic_rnn(
-            lstm,
-            x,
+        # print('rnn_net: ', rnn_net)
+
+        lstm_outputs, lstm_state_out = rnn_net(
+            cell=lstm,
+            inputs=x,
             initial_state=lstm_state_pl,
             sequence_length=lstm_sequence_length,
-            time_major=False
         )
-        #x_out = tf.reshape(lstm_outputs, [-1, lstm_layers[-1]])
-        x_out = lstm_outputs
-    return x_out, lstm_init_state, lstm_state_out, lstm_state_pl_flatten
+
+        # print('\nlstm_outputs: ', lstm_outputs)
+        # print('\nlstm_state_out:', lstm_state_out)
+
+        # Unwrap and expand:
+        if static:
+            x_out = lstm_outputs[0][:, None, :]
+        else:
+            x_out = lstm_outputs
+        state_out = lstm_state_out
+    return x_out, lstm_init_state, state_out, lstm_state_pl_flatten
 
 
-def dense_aac_network(x, ac_space, name='dense_aac', linear_layer_ref=noisy_linear, reuse=False):
+def dense_aac_network(x, ac_space_depth, name='dense_aac', linear_layer_ref=noisy_linear, reuse=False):
     """
     Stage3 network: from LSTM flattened output to advantage actor-critic.
 
     Returns:
-        logits tensor
-        value function tensor
-        action sampling function.
+        dictionary containg tuples:
+            logits tensor
+            value function tensor
+            action sampling function.
+        for every space in ac_space_shape dictionary
     """
+
     with tf.variable_scope(name, reuse=reuse):
         # Center-logits:
         logits = norm_layer(
             linear_layer_ref(
                 x=x,
-                size=ac_space,
+                size=ac_space_depth,
                 name='action',
                 initializer=normalized_columns_initializer(0.01),
                 reuse=reuse
@@ -171,14 +196,6 @@ def dense_aac_network(x, ac_space, name='dense_aac', linear_layer_ref=noisy_line
             center=True,
             scale=False,
         )
-
-        # logits = linear_layer_ref(
-        #     x=x,
-        #     size=ac_space,
-        #     name='action',
-        #     initializer=normalized_columns_initializer(0.01),
-        #     reuse=reuse
-        # )
 
         vf = tf.reshape(
             linear_layer_ref(
@@ -190,7 +207,9 @@ def dense_aac_network(x, ac_space, name='dense_aac', linear_layer_ref=noisy_line
             ),
             [-1]
         )
-        sample = categorical_sample(logits, ac_space)[0, :]
+        sample = categorical_sample(logits=logits, depth=ac_space_depth)[0, :]
+
+
 
     return logits, vf, sample
 

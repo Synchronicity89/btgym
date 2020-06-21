@@ -5,6 +5,10 @@ from tensorflow.python.util.nest import flatten as flatten_nested
 from tensorflow.python.util.nest import assert_same_structure
 from tensorflow.contrib.rnn import LSTMStateTuple
 
+from gym.spaces import Discrete, Dict
+
+from itertools import product
+
 
 def rnn_placeholders(state):
     """
@@ -41,12 +45,35 @@ def nested_placeholders(ob_space, batch_dim=None, name='nested'):
     Returns:
         nested dictionary of placeholders
     """
-    if isinstance(ob_space,dict):
+    if isinstance(ob_space, dict):
         out = {key: nested_placeholders(value, batch_dim, name + '_' + key) for key, value in ob_space.items()}
         return out
     else:
         out = tf.placeholder(tf.float32, [batch_dim] + list(ob_space), name + '_pl')
         return out
+
+
+def nested_discrete_gym_shape(ac_space):
+    """
+    Given instance of gym.spaces.Dict holding base  gym.spaces.Discrete,
+    returns nested dictionary of  spaces depths ( =dict of gym.spaces.Discrete.n)
+    This util is here due to fact in practice we need .n attr of discrete space [as cat. encoding depth]
+     rather than .shape, which is always ()
+
+    Args:
+        ac_space: instance of gym.spaces.Dict
+
+    Returns:
+        nested dictionary of lengths
+    """
+    if isinstance(ac_space, Dict):
+        return {key: nested_discrete_gym_shape(space) for key, space in ac_space.spaces.items()}
+
+    elif isinstance(ac_space, Discrete):
+        return (ac_space.n,)
+
+    else:
+        raise TypeError('Expected gym.spaces.Dict or gym.spaces.Discrete, got: {}'.format(ac_space))
 
 
 def flat_placeholders(ob_space, batch_dim=None, name='flt'):
@@ -133,7 +160,7 @@ def as_array(struct):
 def batch_stack(dict_list, _top=True):
     """
     Stacks values of given processed rollouts along batch dimension.
-    Initial batch dimension is saved as key 'batch_size' for further shape inference.
+    Cumulative batch dimension is saved as key 'batch_size' for further shape inference.
 
     Example:
         dict_list sizes: [[20,10,10,1], [20,10,10,1]] --> result size: [40,10,10,1],
@@ -171,6 +198,43 @@ def batch_stack(dict_list, _top=True):
         # Mind shape inference:
         batch['batch_size'] = batch['batch_size'].sum()
         
+    return batch
+
+
+def batch_gather(batch_dict, indices, _top=True):
+    """
+    Gathers experiences from processed batch according to specified indices.
+
+    Args:
+        batch_dict:     batched data dictionary
+        indices:        array-like, indices to gather
+        _top:           internal
+
+    Returns:
+        batched data of same structure as dict
+
+    """
+    batch = {}
+
+    if isinstance(batch_dict, dict):
+        for key, value in batch_dict.items():
+            batch[key] = batch_gather(value, indices, False)
+
+    elif isinstance(batch_dict, LSTMStateTuple):
+        c = batch_gather(batch_dict[0], indices, False)
+        h = batch_gather(batch_dict[1], indices, False)
+        batch = LSTMStateTuple(c=c, h=h)
+
+    elif isinstance(batch_dict, tuple):
+        batch = tuple([batch_gather(struct, indices, False) for struct in batch_dict])
+
+    else:
+        batch = np.take(batch_dict, indices=indices, axis=0, mode='wrap')
+
+    if _top:
+        # Mind shape inference:
+        batch['batch_size'] = indices.shape[0]
+
     return batch
 
 
@@ -214,6 +278,33 @@ def batch_pad(batch, to_size, _one_hot=False):
     return padded_batch
 
 
+def is_subdict(sub_dict, big_dict):
+    """
+    Checks if first arg is sub_dictionary of second arg by means of structure and values.
+
+    Args:
+        sub_dict:       dictionary
+        big_dict:       dictionary
+
+    Returns:
+        bool
+    """
+    conditions = []
+    if isinstance(sub_dict, dict):
+        for key, value in sub_dict.items():
+            try:
+                conditions.append(is_subdict(value, big_dict[key]))
+            except KeyError:
+                conditions.append(False)
+    else:
+        try:
+            conditions.append(sub_dict == big_dict)
+        except KeyError:
+            conditions.append(False)
+
+    return np.asarray(conditions).all()
+
+
 def _show_struct(struct):
     # Debug utility
     if isinstance(struct, dict):
@@ -228,7 +319,7 @@ def _show_struct(struct):
 
     else:
         try:
-            print('shape:', struct.shape)
+            print('shape: {}, type: {}'.format(np.asarray(struct).shape, type(struct)))
 
         except AttributeError:
             print('value:', struct)

@@ -80,6 +80,11 @@ class DevStrat_2_0(DevStrat_4_10):
                 }
             )
         },
+        cash_name='default_cash',
+        asset_names=['default_asset'],
+        start_cash=None,
+        commission=None,
+        leverage=1.0,
         drawdown_call=5,
         target_call=19,
         portfolio_actions=portfolio_actions,
@@ -100,7 +105,7 @@ class DevStrat_2_0(DevStrat_4_10):
         # Define CWT scales:
         self.cwt_width = np.linspace(self.p.cwt_lower_bound, self.p.cwt_upper_bound, self.num_channels)
 
-    def get_market_state(self):
+    def get_external_state(self):
         # Use Hi-Low median as signal:
         x = (
             np.frombuffer(self.data.high.get(size=self.time_dim)) +
@@ -122,14 +127,14 @@ class DevStrat_2_0(DevStrat_4_10):
 
         return out_x[:, None, :]
 
-    def get_broker_state(self):
+    def get_internal_state(self):
         x_broker = np.concatenate(
             [
-                np.asarray(self.sliding_stat['broker_value'])[..., None],
-                np.asarray(self.sliding_stat['unrealized_pnl'])[..., None],
-                np.asarray(self.sliding_stat['realized_pnl'])[..., None],
-                np.asarray(self.sliding_stat['broker_cash'])[..., None],
-                np.asarray(self.sliding_stat['exposure'])[..., None],
+                np.asarray(self.broker_stat['broker_value'])[..., None],
+                np.asarray(self.broker_stat['unrealized_pnl'])[..., None],
+                np.asarray(self.broker_stat['realized_pnl'])[..., None],
+                np.asarray(self.broker_stat['broker_cash'])[..., None],
+                np.asarray(self.broker_stat['exposure'])[..., None],
             ],
             axis=-1
         )

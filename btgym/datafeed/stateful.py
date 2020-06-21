@@ -324,3 +324,5 @@ class BTgymSequentialDataDomain(BTgymRandomDataDomain):
             trial = self._sample_interval(interval, name='sequential_trial_')
             self.sample_num += 1
             return trial
+
+

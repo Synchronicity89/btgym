@@ -4,7 +4,7 @@ from btgym.algorithms.math_utils import cat_entropy, kl_divergence
 
 
 def aac_loss_def(act_target, adv_target, r_target, pi_logits, pi_vf, pi_prime_logits,
-                 entropy_beta, epsilon, name='_aac_', verbose=False):
+                 entropy_beta, epsilon=None, name='_aac_', verbose=False):
     """
     Advantage Actor Critic loss definition.
     Paper: https://arxiv.org/abs/1602.01783
@@ -37,6 +37,7 @@ def aac_loss_def(act_target, adv_target, r_target, pi_logits, pi_vf, pi_prime_lo
         loss = pi_loss + vf_loss - entropy * entropy_beta
 
         mean_vf = tf.reduce_mean(pi_vf)
+        mean_t_target = tf.reduce_mean(r_target)
 
         summaries = [
             tf.summary.scalar('policy_loss', pi_loss),
@@ -46,6 +47,9 @@ def aac_loss_def(act_target, adv_target, r_target, pi_logits, pi_vf, pi_prime_lo
             summaries += [
                 tf.summary.scalar('entropy', entropy),
                 tf.summary.scalar('value_fn', mean_vf),
+                # tf.summary.scalar('empirical_return',mean_t_target),
+                # tf.summary.histogram('value_fn', pi_vf),
+                # tf.summary.histogram('empirical_return', r_target),
             ]
 
     return loss, summaries
@@ -172,7 +176,7 @@ def pc_loss_def(actions, targets, pi_pc_q, name='_pc_', verbose=False):
         # Get Q-value features for actions been taken and define loss:
         pc_action_reshaped = tf.reshape(actions, [-1, 1, 1, tf.shape(actions)[-1]])
         pc_q_action = tf.multiply(pi_pc_q, pc_action_reshaped)
-        pc_q_action = tf.reduce_sum(pc_q_action, axis=-1, keep_dims=False)
+        pc_q_action = tf.reduce_sum(pc_q_action, axis=-1, keepdims=False)
 
         batch_size = tf.shape(targets)[0]
         loss = tf.reduce_sum(tf.square(targets - pc_q_action)) / tf.cast(batch_size, tf.float32)

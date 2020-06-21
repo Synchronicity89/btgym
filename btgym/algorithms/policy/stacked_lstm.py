@@ -4,6 +4,8 @@ from btgym.algorithms.policy.base import BaseAacPolicy
 from btgym.algorithms.nn.networks import *
 from btgym.algorithms.utils import *
 
+from btgym.spaces import DictSpace, ActionDictSpace
+
 
 class StackedLstmPolicy(BaseAacPolicy):
     """
@@ -24,12 +26,17 @@ class StackedLstmPolicy(BaseAacPolicy):
                  ob_space,
                  ac_space,
                  rp_sequence_size,
+                 state_encoder_class_ref=conv_2d_network,
                  lstm_class_ref=tf.contrib.rnn.LayerNormBasicLSTMCell,
-                 #lstm_class_ref=rnn.BasicLSTMCell,
                  lstm_layers=(256, 256),
-                 linear_layer_ref=linear,
+                 linear_layer_ref=noisy_linear,
+                 share_encoder_params=False,
+                 dropout_keep_prob=1.0,
+                 action_dp_alpha=200.0,
                  aux_estimate=False,
-                 encode_internal_state=False,
+                 encode_internal_state=None,
+                 static_rnn=True,
+                 shared_p_v=False,
                  **kwargs):
         """
         Defines [partially shared] on/off-policy networks for estimating  action-logits, value function,
@@ -37,46 +44,68 @@ class StackedLstmPolicy(BaseAacPolicy):
         Expects multi-modal observation as array of shape `ob_space`.
 
         Args:
-            ob_space:           dictionary of observation state shapes
-            ac_space:           discrete action space shape (length)
-            rp_sequence_size:   reward prediction sample length
-            lstm_class_ref:     tf.nn.lstm class to use
-            lstm_layers:        tuple of LSTM layers sizes
-            linear_layer_ref:   linear layer class to use
-            aux_estimate:       (bool), if True - add auxiliary tasks estimations to self.callbacks dictionary.
-            **kwargs            not used
+            ob_space:               instance of btgym.spaces.DictSpace
+            ac_space:               instance of btgym.spaces.ActionDictSpace
+            rp_sequence_size:       reward prediction sample length
+            lstm_class_ref:         tf.nn.lstm class to use
+            lstm_layers:            tuple of LSTM layers sizes
+            linear_layer_ref:       linear layer class to use
+            share_encoder_params:   bool, whether to share encoder parameters for every 'external' data stream
+            dropout_keep_prob:      in (0, 1] dropout regularisation parameter
+            action_dp_alpha:
+            aux_estimate:           (bool), if True - add auxiliary tasks estimations to self.callbacks dictionary
+            encode_internal_state:  legacy, not used
+            static_rnn:             (bool), it True - use static rnn graph, dynamic otherwise
+            **kwargs                not used
         """
-        # 1D plug-in:
-        kwargs.update(
-            dict(
-                conv_2d_filter_size=[3, 1],
-                conv_2d_stride=[2, 1],
-                conv_2d_num_filters=[32, 32, 64, 64],
-                pc_estimator_stride=[2, 1],
-                duell_pc_x_inner_shape=(6, 1, 32),  # [6,3,32] if swapping W-C dims
-                duell_pc_filter_size=(4, 1),
-                duell_pc_stride=(2, 1),
-            )
-        )
 
+        assert isinstance(ob_space, DictSpace), \
+            'Expected observation space be instance of btgym.spaces.DictSpace, got: {}'.format(ob_space)
         self.ob_space = ob_space
+
+        assert isinstance(ac_space, ActionDictSpace), \
+            'Expected action space be instance of btgym.spaces.ActionDictSpace, got: {}'.format(ac_space)
+
         self.ac_space = ac_space
         self.rp_sequence_size = rp_sequence_size
+        self.state_encoder_class_ref = state_encoder_class_ref
         self.lstm_class = lstm_class_ref
         self.lstm_layers = lstm_layers
+        self.action_dp_alpha = action_dp_alpha
         self.aux_estimate = aux_estimate
         self.callback = {}
-        self.encode_internal_state = encode_internal_state
+        # self.encode_internal_state = encode_internal_state
+        self.share_encoder_params = share_encoder_params
+        if self.share_encoder_params:
+            self.reuse_encoder_params = tf.AUTO_REUSE
+
+        else:
+            self.reuse_encoder_params = False
+        self.static_rnn = static_rnn
+        self.dropout_keep_prob = dropout_keep_prob
+        assert 0 < self.dropout_keep_prob <= 1, 'Dropout keep_prob value should be in (0, 1]'
+
         self.debug = {}
 
         # Placeholders for obs. state input:
-        self.on_state_in = nested_placeholders(ob_space, batch_dim=None, name='on_policy_state_in')
-        self.off_state_in = nested_placeholders(ob_space, batch_dim=None, name='off_policy_state_in_pl')
-        self.rp_state_in = nested_placeholders(ob_space, batch_dim=None, name='rp_state_in')
+        self.on_state_in = nested_placeholders(self.ob_space.shape, batch_dim=None, name='on_policy_state_in')
+        self.off_state_in = nested_placeholders(self.ob_space.shape, batch_dim=None, name='off_policy_state_in_pl')
+        self.rp_state_in = nested_placeholders(self.ob_space.shape, batch_dim=None, name='rp_state_in')
 
-        # Placeholders for concatenated action [one-hot] and reward [scalar]:
-        self.on_a_r_in = tf.placeholder(tf.float32, [None, ac_space + 1], name='on_policy_action_reward_in_pl')
-        self.off_a_r_in = tf.placeholder(tf.float32, [None, ac_space + 1], name='off_policy_action_reward_in_pl')
+        # Placeholders for previous step action[multi-categorical vector encoding]  and reward [scalar]:
+        self.on_last_a_in = tf.placeholder(
+            tf.float32,
+            [None, self.ac_space.encoded_depth],
+            name='on_policy_last_action_in_pl'
+        )
+        self.on_last_reward_in = tf.placeholder(tf.float32, [None], name='on_policy_last_reward_in_pl')
+
+        self.off_last_a_in = tf.placeholder(
+            tf.float32,
+            [None, self.ac_space.encoded_depth],
+            name='off_policy_last_action_in_pl'
+        )
+        self.off_last_reward_in = tf.placeholder(tf.float32, [None], name='off_policy_last_reward_in_pl')
 
         # Placeholders for rnn batch and time-step dimensions:
         self.on_batch_size = tf.placeholder(tf.int32, name='on_policy_batch_size')
@@ -85,129 +114,218 @@ class StackedLstmPolicy(BaseAacPolicy):
         self.off_batch_size = tf.placeholder(tf.int32, name='off_policy_batch_size')
         self.off_time_length = tf.placeholder(tf.int32, name='off_policy_sequence_size')
 
+        self.debug['on_state_in_keys'] = list(self.on_state_in.keys())
+
+        # Dropout related:
+        try:
+            if self.train_phase is not None:
+                pass
+
+        except AttributeError:
+            self.train_phase = tf.placeholder_with_default(
+                tf.constant(False, dtype=tf.bool),
+                shape=(),
+                name='train_phase_flag_pl'
+            )
+        self.keep_prob = 1.0 - (1.0 - self.dropout_keep_prob) * tf.cast(self.train_phase, tf.float32)
+
+        # Default parameters:
+        default_kwargs = dict(
+            conv_2d_filter_size=[3, 1],
+            conv_2d_stride=[2, 1],
+            conv_2d_num_filters=[32, 32, 64, 64],
+            pc_estimator_stride=[2, 1],
+            duell_pc_x_inner_shape=(6, 1, 32),  # [6,3,32] if swapping W-C dims
+            duell_pc_filter_size=(4, 1),
+            duell_pc_stride=(2, 1),
+            keep_prob=self.keep_prob,
+        )
+        # Insert if not already:
+        for key, default_value in default_kwargs.items():
+            if key not in kwargs.keys():
+                kwargs[key] = default_value
+
         # Base on-policy AAC network:
-        # Conv. layers:
-        on_aac_x = conv_2d_network(
-            self.on_state_in['external'],
-            ob_space['external'],
-            ac_space,
-            name='conv1d_external',
-            **kwargs
+        self.modes_to_encode = ['external', 'internal']
+        for mode in self.modes_to_encode:
+            assert mode in self.on_state_in.keys(), \
+                'Required top-level mode `{}` not found in state shape specification'.format(mode)
+
+        # Separately encode than concatenate all `external` and 'internal' states modes,
+        # [jointly] encode every stream within mode:
+        self.on_aac_x_encoded = {}
+        for key in self.modes_to_encode:
+            if isinstance(self.on_state_in[key], dict):  # got dictionary of data streams
+                if self.share_encoder_params:
+                    layer_name_template = 'encoded_{}_shared'
+                else:
+                    layer_name_template = 'encoded_{}_{}'
+                encoded_streams = {
+                    name: tf.layers.flatten(
+                        self.state_encoder_class_ref(
+                            x=stream,
+                            ob_space=self.ob_space.shape[key][name],
+                            ac_space=self.ac_space,
+                            name=layer_name_template.format(key, name),
+                            reuse=self.reuse_encoder_params,  # shared params for all streams in mode
+                            **kwargs
+                        )
+                    )
+                    for name, stream in self.on_state_in[key].items()
+                }
+                encoded_mode = tf.concat(
+                    list(encoded_streams.values()),
+                    axis=-1,
+                    name='multi_encoded_{}'.format(key)
+                )
+            else:
+                # Got single data stream:
+                encoded_mode = tf.layers.flatten(
+                    self.state_encoder_class_ref(
+                        x=self.on_state_in[key],
+                        ob_space=self.ob_space.shape[key],
+                        ac_space=self.ac_space,
+                        name='encoded_{}'.format(key),
+                        **kwargs
+                    )
+                )
+            self.on_aac_x_encoded[key] = encoded_mode
+
+        self.debug['on_state_external_encoded_dict'] = self.on_aac_x_encoded
+
+        # on_aac_x = tf.concat(list(self.on_aac_x_encoded.values()), axis=-1, name='on_state_external_encoded')
+        on_aac_x = self.on_aac_x_encoded['external']
+
+        self.debug['on_state_external_encoded'] = on_aac_x
+
+        # TODO: for encoder prediction test, output `naive` estimates for logits and value directly from encoder:
+        [self.on_simple_logits, self.on_simple_value, _] = dense_aac_network(
+            tf.layers.flatten(on_aac_x),
+            ac_space_depth=self.ac_space.one_hot_depth,
+            linear_layer_ref=linear_layer_ref,
+            name='aac_dense_simple_pi_v'
         )
 
-        # Aux min/max_loss:
-        if 'raw_state' in list(self.on_state_in.keys()):
-            self.raw_state = self.on_state_in['raw_state']
-            self.state_min_max = tf.nn.elu(
-                linear(
-                    batch_flatten(on_aac_x),
-                    2,
-                    "min_max",
-                    normalized_columns_initializer(0.01)
-                )
-            )
-        else:
-            self.raw_state = None
-            self.state_min_max = None
-
-            # Reshape rnn inputs for  batch training as [rnn_batch_dim, rnn_time_dim, flattened_depth]:
+        # Reshape rnn inputs for batch training as: [rnn_batch_dim, rnn_time_dim, flattened_depth]:
         x_shape_dynamic = tf.shape(on_aac_x)
         max_seq_len = tf.cast(x_shape_dynamic[0] / self.on_batch_size, tf.int32)
         x_shape_static = on_aac_x.get_shape().as_list()
 
-        on_a_r_in = tf.reshape(self.on_a_r_in, [self.on_batch_size, max_seq_len, ac_space + 1])
-        on_aac_x = tf.reshape( on_aac_x, [self.on_batch_size, max_seq_len, np.prod(x_shape_static[1:])])
+        on_last_action_in = tf.reshape(
+            self.on_last_a_in,
+            [self.on_batch_size, max_seq_len, self.ac_space.encoded_depth]
+        )
+        on_last_r_in = tf.reshape(self.on_last_reward_in, [self.on_batch_size, max_seq_len, 1])
 
-        # Prepare `internal` state, if any:
-        if 'internal' in list(self.on_state_in.keys()):
-            if self.encode_internal_state:
-                # Use convolution encoder:
-                on_x_internal = conv_2d_network(
-                    self.on_state_in['internal'],
-                    ob_space['internal'],
-                    ac_space,
-                    name='conv1d_internal',
-                    # conv_2d_layer_ref=conv2d_dw,
-                    conv_2d_num_filters=32,
-                    conv_2d_num_layers=2,
-                    conv_2d_filter_size=[3, 1],
-                    conv_2d_stride=[2, 1],
-                )
-                x_int_shape_static = on_x_internal.get_shape().as_list()
-                on_x_internal = [
-                    tf.reshape(on_x_internal, [self.on_batch_size, max_seq_len, np.prod(x_int_shape_static[1:])])]
-                self.debug['state_internal_enc'] = tf.shape(on_x_internal)
+        on_aac_x = tf.reshape(on_aac_x, [self.on_batch_size, max_seq_len, np.prod(x_shape_static[1:])])
 
-            else:
-                # Feed as is:
-                x_int_shape_static = self.on_state_in['internal'].get_shape().as_list()
-                on_x_internal = tf.reshape(
-                    self.on_state_in['internal'],
-                    [self.on_batch_size, max_seq_len, np.prod(x_int_shape_static[1:])]
-                )
-                self.debug['state_internal'] = tf.shape(self.on_state_in['internal'])
-                on_x_internal = [on_x_internal]
+        # # Prepare `internal` state, if any:
+        # if 'internal' in list(self.on_state_in.keys()):
+        #     if self.encode_internal_state:
+        #         # Use convolution encoder:
+        #         on_x_internal = self.state_encoder_class_ref(
+        #             x=self.on_state_in['internal'],
+        #             ob_space=self.ob_space.shape['internal'],
+        #             ac_space=self.ac_space,
+        #             name='encoded_internal',
+        #             **kwargs
+        #         )
+        #         x_int_shape_static = on_x_internal.get_shape().as_list()
+        #         on_x_internal = [
+        #             tf.reshape(on_x_internal, [self.on_batch_size, max_seq_len, np.prod(x_int_shape_static[1:])])]
+        #         self.debug['on_state_internal_encoded'] = on_x_internal
+        #
+        #     else:
+        #         # Feed as is:
+        #         x_int_shape_static = self.on_state_in['internal'].get_shape().as_list()
+        #         on_x_internal = tf.reshape(
+        #             self.on_state_in['internal'],
+        #             [self.on_batch_size, max_seq_len, np.prod(x_int_shape_static[1:])]
+        #         )
+        #         self.debug['on_state_internal_encoded'] = on_x_internal
+        #         on_x_internal = [on_x_internal]
+        #
+        # else:
+        #     on_x_internal = []
 
-        else:
-            on_x_internal = []
+        on_x_internal = self.on_aac_x_encoded['internal']
 
-        # Not used:
-        if 'reward' in list(self.on_state_in.keys()):
-            x_rewards_shape_static = self.on_state_in['reward'].get_shape().as_list()
-            x_rewards = tf.reshape(
-                self.on_state_in['reward'],
-                [self.on_batch_size, max_seq_len, np.prod(x_rewards_shape_static[1:])]
+        # Reshape to batch-feed rnn:
+        x_int_shape_static = on_x_internal.get_shape().as_list()
+        on_x_internal = tf.reshape(
+            on_x_internal,
+            [self.on_batch_size, max_seq_len, np.prod(x_int_shape_static[1:])]
+        )
+        self.debug['on_state_internal_encoded'] = on_x_internal
+
+        on_x_internal = [on_x_internal]
+
+        # Prepare datetime index if any:
+        if 'datetime' in list(self.on_state_in.keys()):
+            x_dt_shape_static = self.on_state_in['datetime'].get_shape().as_list()
+            on_x_dt = tf.reshape(
+                self.on_state_in['datetime'],
+                [self.on_batch_size, max_seq_len, np.prod(x_dt_shape_static[1:])]
             )
-            self.debug['rewards'] = tf.shape(x_rewards)
-            x_rewards = [x_rewards]
+            on_x_dt = [on_x_dt]
 
         else:
-            x_rewards = []
+            on_x_dt = []
 
-        self.debug['conv_input_to_lstm1'] = tf.shape(on_aac_x)
+        self.debug['on_state_dt_encoded'] = on_x_dt
+        self.debug['conv_input_to_lstm1'] = on_aac_x
 
-        # Feed last last_reward into LSTM_1 layer along with encoded `external` state features:
-        on_stage2_1_input = [on_aac_x, on_a_r_in[..., -1][..., None]] #+ on_x_internal
+        # Feed last last_reward into LSTM_1 layer along with encoded `external` state features and datetime stamp:
+        # on_stage2_1_input = [on_aac_x, on_last_action_in, on_last_reward_in] + on_x_dt
+        on_stage2_1_input = [on_aac_x, on_last_r_in] #+ on_x_dt
 
-        # Feed last_action, encoded `external` state,  `internal` state into LSTM_2:
-        on_stage2_2_input = [on_aac_x, on_a_r_in] + on_x_internal
+        # Feed last_action, encoded `external` state,  `internal` state, datetime stamp into LSTM_2:
+        # on_stage2_2_input = [on_aac_x, on_last_action_in, on_last_reward_in] + on_x_internal + on_x_dt
+        on_stage2_2_input = [on_aac_x, on_last_action_in] + on_x_internal #+ on_x_dt
 
         # LSTM_1 full input:
         on_aac_x = tf.concat(on_stage2_1_input, axis=-1)
 
-        self.debug['concat_input_to_lstm1'] = tf.shape(on_aac_x)
+        self.debug['concat_input_to_lstm1'] = on_aac_x
 
         # First LSTM layer takes encoded `external` state:
         [on_x_lstm_1_out, self.on_lstm_1_init_state, self.on_lstm_1_state_out, self.on_lstm_1_state_pl_flatten] =\
-            lstm_network(on_aac_x, self.on_time_length, lstm_class_ref, (lstm_layers[0],), name='lstm_1')
+            lstm_network(
+                x=on_aac_x,
+                lstm_sequence_length=self.on_time_length,
+                lstm_class=lstm_class_ref,
+                lstm_layers=(lstm_layers[0],),
+                static=static_rnn,
+                name='lstm_1',
+                **kwargs,
+            )
 
-        self.debug['on_x_lstm_1_out'] = tf.shape(on_x_lstm_1_out)
-        self.debug['self.on_lstm_1_state_out'] = tf.shape(self.on_lstm_1_state_out)
-        self.debug['self.on_lstm_1_state_pl_flatten'] = tf.shape(self.on_lstm_1_state_pl_flatten)
+        # var_list = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, tf.get_variable_scope().name)
+        # print('var_list: ', var_list)
+
+        self.debug['on_x_lstm_1_out'] = on_x_lstm_1_out
+        self.debug['self.on_lstm_1_state_out'] = self.on_lstm_1_state_out
+        self.debug['self.on_lstm_1_state_pl_flatten'] = self.on_lstm_1_state_pl_flatten
 
         # For time_flat only: Reshape on_lstm_1_state_out from [1,2,20,size] -->[20,1,2,size] --> [20,1, 2xsize]:
         reshape_lstm_1_state_out = tf.transpose(self.on_lstm_1_state_out, [2, 0, 1, 3])
         reshape_lstm_1_state_out_shape_static = reshape_lstm_1_state_out.get_shape().as_list()
-        reshape_lstm_1_state_out = tf.reshape(
-            reshape_lstm_1_state_out,
-            [self.on_batch_size, max_seq_len, np.prod(reshape_lstm_1_state_out_shape_static[-2:])],
-        )
-        #self.debug['reshape_lstm_1_state_out'] = tf.shape(reshape_lstm_1_state_out)
 
         # Take policy logits off first LSTM-dense layer:
         # Reshape back to [batch, flattened_depth], where batch = rnn_batch_dim * rnn_time_dim:
         x_shape_static = on_x_lstm_1_out.get_shape().as_list()
         rsh_on_x_lstm_1_out = tf.reshape(on_x_lstm_1_out, [x_shape_dynamic[0], x_shape_static[-1]])
 
-        self.debug['reshaped_on_x_lstm_1_out'] = tf.shape(rsh_on_x_lstm_1_out)
+        self.debug['reshaped_on_x_lstm_1_out'] = rsh_on_x_lstm_1_out
 
-        # Aac policy output and action-sampling function:
-        [self.on_logits, _, self.on_sample] = dense_aac_network(
-            rsh_on_x_lstm_1_out,
-            ac_space,
-            linear_layer_ref=linear_layer_ref,
-            name='aac_dense_pi'
-        )
+        if not shared_p_v:
+            # Aac policy output and action-sampling function:
+            [self.on_logits, _, self.on_sample] = dense_aac_network(
+                rsh_on_x_lstm_1_out,
+                ac_space_depth=self.ac_space.one_hot_depth,
+                linear_layer_ref=linear_layer_ref,
+                name='aac_dense_pi'
+            )
 
         # Second LSTM layer takes concatenated encoded 'external' state, LSTM_1 output,
         # last_action and `internal_state` (if present) tensors:
@@ -219,106 +337,189 @@ class StackedLstmPolicy(BaseAacPolicy):
         # LSTM_2 full input:
         on_aac_x = tf.concat(on_stage2_2_input, axis=-1)
 
-        self.debug['on_stage2_2_input'] = tf.shape(on_aac_x)
+        self.debug['on_stage2_2_input'] = on_aac_x
 
         [on_x_lstm_2_out, self.on_lstm_2_init_state, self.on_lstm_2_state_out, self.on_lstm_2_state_pl_flatten] = \
-            lstm_network(on_aac_x, self.on_time_length, lstm_class_ref, (lstm_layers[-1],), name='lstm_2')
+            lstm_network(
+                x=on_aac_x,
+                lstm_sequence_length=self.on_time_length,
+                lstm_class=lstm_class_ref,
+                lstm_layers=(lstm_layers[-1],),
+                static=static_rnn,
+                name='lstm_2',
+                **kwargs,
+            )
 
-        self.debug['on_x_lstm_2_out'] = tf.shape(on_x_lstm_2_out)
-        self.debug['self.on_lstm_2_state_out'] = tf.shape(self.on_lstm_2_state_out)
-        self.debug['self.on_lstm_2_state_pl_flatten'] = tf.shape(self.on_lstm_2_state_pl_flatten)
+        self.debug['on_x_lstm_2_out'] = on_x_lstm_2_out
+        self.debug['self.on_lstm_2_state_out'] = self.on_lstm_2_state_out
+        self.debug['self.on_lstm_2_state_pl_flatten'] = self.on_lstm_2_state_pl_flatten
 
         # Reshape back to [batch, flattened_depth], where batch = rnn_batch_dim * rnn_time_dim:
         x_shape_static = on_x_lstm_2_out.get_shape().as_list()
-        on_x_lstm_out = tf.reshape(on_x_lstm_2_out, [x_shape_dynamic[0], x_shape_static[-1]])
+        rsh_on_x_lstm_2_out = tf.reshape(on_x_lstm_2_out, [x_shape_dynamic[0], x_shape_static[-1]])
 
-        self.debug['reshaped_on_x_lstm_out'] = tf.shape(on_x_lstm_out)
+        self.debug['reshaped_on_x_lstm_2_out'] = rsh_on_x_lstm_2_out
 
-        # Aac value function:
-        [_, self.on_vf, _] = dense_aac_network(
-            on_x_lstm_out,
-            ac_space,
-            linear_layer_ref=linear_layer_ref,
-            name='aac_dense_vfn'
-        )
+        if shared_p_v:
+            [self.on_logits, self.on_vf, self.on_sample] = dense_aac_network(
+                rsh_on_x_lstm_2_out,
+                ac_space_depth=self.ac_space.one_hot_depth,
+                linear_layer_ref=linear_layer_ref,
+                name='aac_dense_pi_vfn'
+            )
+
+        else:
+            # Aac value function:
+            [_, self.on_vf, _] = dense_aac_network(
+                rsh_on_x_lstm_2_out,
+                ac_space_depth=self.ac_space.one_hot_depth,
+                linear_layer_ref=linear_layer_ref,
+                name='aac_dense_vfn'
+            )
 
         # Concatenate LSTM placeholders, init. states and context:
         self.on_lstm_init_state = (self.on_lstm_1_init_state, self.on_lstm_2_init_state)
         self.on_lstm_state_out = (self.on_lstm_1_state_out, self.on_lstm_2_state_out)
         self.on_lstm_state_pl_flatten = self.on_lstm_1_state_pl_flatten + self.on_lstm_2_state_pl_flatten
 
+        self.off_aac_x_encoded = {}
+        for key in self.modes_to_encode:
+            if isinstance(self.off_state_in[key], dict):  # got dictionary of data streams
+                if self.share_encoder_params:
+                    layer_name_template = 'encoded_{}_shared'
+                else:
+                    layer_name_template = 'encoded_{}_{}'
+                encoded_streams = {
+                    name: tf.layers.flatten(
+                        self.state_encoder_class_ref(
+                            x=stream,
+                            ob_space=self.ob_space.shape[key][name],
+                            ac_space=self.ac_space,
+                            name=layer_name_template.format(key, name),
+                            reuse=True,  # shared params for all streams in mode
+                            **kwargs
+                        )
+                    )
+                    for name, stream in self.off_state_in[key].items()
+                }
+                encoded_mode = tf.concat(
+                    list(encoded_streams.values()),
+                    axis=-1,
+                    name='multi_encoded_{}'.format(key)
+                )
+            else:
+                # Got single data stream:
+                encoded_mode = tf.layers.flatten(
+                    self.state_encoder_class_ref(
+                        x=self.off_state_in[key],
+                        ob_space=self.ob_space.shape[key],
+                        ac_space=self.ac_space,
+                        name='encoded_{}'.format(key),
+                        reuse=True,
+                        **kwargs
+                    )
+                )
+            self.off_aac_x_encoded[key] = encoded_mode
 
-        #if False: # Temp. disable
+        # off_aac_x = tf.concat(list(self.off_aac_x_encoded.values()), axis=-1, name='off_state_external_encoded')
 
-        # Off-policy AAC network (shared):
-        off_aac_x = conv_2d_network(
-            self.off_state_in['external'],
-            ob_space['external'],
-            ac_space,
-            name='conv1d_external',
-            reuse=True,
-            **kwargs
-        )
+        off_aac_x = self.off_aac_x_encoded['external']
+
         # Reshape rnn inputs for  batch training as [rnn_batch_dim, rnn_time_dim, flattened_depth]:
         x_shape_dynamic = tf.shape(off_aac_x)
         max_seq_len = tf.cast(x_shape_dynamic[0] / self.off_batch_size, tf.int32)
         x_shape_static = off_aac_x.get_shape().as_list()
 
-        off_a_r_in = tf.reshape(self.off_a_r_in, [self.off_batch_size, max_seq_len, ac_space + 1])
+        off_last_action_in = tf.reshape(
+            self.off_last_a_in,
+            [self.off_batch_size, max_seq_len, self.ac_space.encoded_depth]
+        )
+        off_last_r_in = tf.reshape(self.off_last_reward_in, [self.off_batch_size, max_seq_len, 1])
+
         off_aac_x = tf.reshape( off_aac_x, [self.off_batch_size, max_seq_len, np.prod(x_shape_static[1:])])
 
-        # Prepare `internal` state, if any:
-        if 'internal' in list(self.off_state_in.keys()):
-            if self.encode_internal_state:
-                # Use convolution encoder:
-                off_x_internal = conv_2d_network(
-                    self.off_state_in['internal'],
-                    ob_space['internal'],
-                    ac_space,
-                    name='conv1d_internal',
-                    # conv_2d_layer_ref=conv2d_dw,
-                    conv_2d_num_filters=32,
-                    conv_2d_num_layers=2,
-                    conv_2d_filter_size=[3, 1],
-                    conv_2d_stride=[2, 1],
-                    reuse=True,
-                )
-                x_int_shape_static = off_x_internal.get_shape().as_list()
-                off_x_internal = [
-                    tf.reshape(off_x_internal, [self.off_batch_size, max_seq_len, np.prod(x_int_shape_static[1:])])
-                ]
-            else:
-                x_int_shape_static = self.off_state_in['internal'].get_shape().as_list()
-                off_x_internal = tf.reshape(
-                    self.off_state_in['internal'],
-                    [self.off_batch_size, max_seq_len, np.prod(x_int_shape_static[1:])]
-                )
-                off_x_internal = [off_x_internal]
+        # # Prepare `internal` state, if any:
+        # if 'internal' in list(self.off_state_in.keys()):
+        #     if self.encode_internal_state:
+        #         # Use convolution encoder:
+        #         off_x_internal = self.state_encoder_class_ref(
+        #             x=self.off_state_in['internal'],
+        #             ob_space=self.ob_space.shape['internal'],
+        #             ac_space=self.ac_space,
+        #             name='encoded_internal',
+        #             reuse=True,
+        #             **kwargs
+        #         )
+        #         x_int_shape_static = off_x_internal.get_shape().as_list()
+        #         off_x_internal = [
+        #             tf.reshape(off_x_internal, [self.off_batch_size, max_seq_len, np.prod(x_int_shape_static[1:])])
+        #         ]
+        #     else:
+        #         x_int_shape_static = self.off_state_in['internal'].get_shape().as_list()
+        #         off_x_internal = tf.reshape(
+        #             self.off_state_in['internal'],
+        #             [self.off_batch_size, max_seq_len, np.prod(x_int_shape_static[1:])]
+        #         )
+        #         off_x_internal = [off_x_internal]
+        #
+        # else:
+        #     off_x_internal = []
+
+        off_x_internal = self.off_aac_x_encoded['internal']
+
+        x_int_shape_static = off_x_internal.get_shape().as_list()
+
+        # Properly feed LSTM2:
+        off_x_internal = tf.reshape(
+            off_x_internal,
+            [self.off_batch_size, max_seq_len, np.prod(x_int_shape_static[1:])]
+        )
+        off_x_internal = [off_x_internal]
+
+        if 'datetime' in list(self.off_state_in.keys()):
+            x_dt_shape_static = self.off_state_in['datetime'].get_shape().as_list()
+            off_x_dt = tf.reshape(
+                self.off_state_in['datetime'],
+                [self.off_batch_size, max_seq_len, np.prod(x_dt_shape_static[1:])]
+            )
+            off_x_dt = [off_x_dt]
 
         else:
-            off_x_internal = []
+            off_x_dt = []
 
-        off_stage2_1_input = [off_aac_x, off_a_r_in[..., -1][..., None]] #+ off_x_internal
+        # off_stage2_1_input = [off_aac_x,  off_last_action_in, off_last_reward_in] + off_x_dt
+        off_stage2_1_input = [off_aac_x, off_last_r_in]  # + off_x_dt
 
-        off_stage2_2_input = [off_aac_x, off_a_r_in] + off_x_internal
+        # off_stage2_2_input = [off_aac_x,  off_last_action_in, off_last_reward_in] + off_x_internal + off_x_dt
+        off_stage2_2_input = [off_aac_x,  off_last_action_in] + off_x_internal  # + off_x_dt
 
         off_aac_x = tf.concat(off_stage2_1_input, axis=-1)
 
         [off_x_lstm_1_out, _, _, self.off_lstm_1_state_pl_flatten] =\
-            lstm_network(off_aac_x, self.off_time_length, lstm_class_ref, (lstm_layers[0],), name='lstm_1', reuse=True)
+            lstm_network(
+                off_aac_x,
+                self.off_time_length,
+                lstm_class_ref,
+                (lstm_layers[0],),
+                name='lstm_1',
+                static=static_rnn,
+                reuse=True,
+                **kwargs,
+            )
 
         # Reshape back to [batch, flattened_depth], where batch = rnn_batch_dim * rnn_time_dim:
         x_shape_static = off_x_lstm_1_out.get_shape().as_list()
         rsh_off_x_lstm_1_out = tf.reshape(off_x_lstm_1_out, [x_shape_dynamic[0], x_shape_static[-1]])
 
-        [self.off_logits, _, _] =\
-            dense_aac_network(
-                rsh_off_x_lstm_1_out,
-                ac_space,
-                linear_layer_ref=linear_layer_ref,
-                name='aac_dense_pi',
-                reuse=True
-            )
+        if not shared_p_v:
+            [self.off_logits, _, _] =\
+                dense_aac_network(
+                    rsh_off_x_lstm_1_out,
+                    ac_space_depth=self.ac_space.one_hot_depth,
+                    linear_layer_ref=linear_layer_ref,
+                    name='aac_dense_pi',
+                    reuse=True
+                )
 
         off_stage2_2_input += [off_x_lstm_1_out]
 
@@ -326,44 +527,63 @@ class StackedLstmPolicy(BaseAacPolicy):
         off_aac_x = tf.concat(off_stage2_2_input, axis=-1)
 
         [off_x_lstm_2_out, _, _, self.off_lstm_2_state_pl_flatten] = \
-            lstm_network(off_aac_x, self.off_time_length, lstm_class_ref, (lstm_layers[-1],), name='lstm_2', reuse=True)
+            lstm_network(
+                off_aac_x,
+                self.off_time_length,
+                lstm_class_ref,
+                (lstm_layers[-1],),
+                name='lstm_2',
+                static=static_rnn,
+                reuse=True,
+                **kwargs,
+            )
 
         # Reshape back to [batch, flattened_depth], where batch = rnn_batch_dim * rnn_time_dim:
         x_shape_static = off_x_lstm_2_out.get_shape().as_list()
-        off_x_lstm_out = tf.reshape(off_x_lstm_2_out, [x_shape_dynamic[0], x_shape_static[-1]])
+        rsh_off_x_lstm_2_out = tf.reshape(off_x_lstm_2_out, [x_shape_dynamic[0], x_shape_static[-1]])
 
-        # Aac value function:
-        [_, self.off_vf, _] = dense_aac_network(
-            off_x_lstm_out,
-            ac_space,
-            linear_layer_ref=linear_layer_ref,
-            name='aac_dense_vfn',
-            reuse=True
-        )
+        if shared_p_v:
+            [self.off_logits, self.off_vf, _] = dense_aac_network(
+                rsh_off_x_lstm_2_out,
+                ac_space_depth=self.ac_space.one_hot_depth,
+                linear_layer_ref=linear_layer_ref,
+                name='aac_dense_pi_vfn',
+                reuse=True
+            )
+        else:
+            # Aac value function:
+            [_, self.off_vf, _] = dense_aac_network(
+                rsh_off_x_lstm_2_out,
+                ac_space_depth=self.ac_space.one_hot_depth,
+                linear_layer_ref=linear_layer_ref,
+                name='aac_dense_vfn',
+                reuse=True
+            )
 
         # Concatenate LSTM states:
         self.off_lstm_state_pl_flatten = self.off_lstm_1_state_pl_flatten + self.off_lstm_2_state_pl_flatten
 
-        # Aux1:
-        # `Pixel control` network.
-        #
-        # Define pixels-change estimation function:
-        # Yes, it rather env-specific but for atari case it is handy to do it here, see self.get_pc_target():
-        [self.pc_change_state_in, self.pc_change_last_state_in, self.pc_target] =\
-            pixel_change_2d_estimator(ob_space['external'], **kwargs)
+        if False:  # TEMP DISABLE
+            # Aux1:
+            # `Pixel control` network.
+            #
+            # Define pixels-change estimation function:
+            # Yes, it rather env-specific but for atari case it is handy to do it here, see self.get_pc_target():
+            [self.pc_change_state_in, self.pc_change_last_state_in, self.pc_target] =\
+                pixel_change_2d_estimator(ob_space['external'], **kwargs)
 
-        self.pc_batch_size = self.off_batch_size
-        self.pc_time_length = self.off_time_length
+            self.pc_batch_size = self.off_batch_size
+            self.pc_time_length = self.off_time_length
 
-        self.pc_state_in = self.off_state_in
-        self.pc_a_r_in = self.off_a_r_in
-        self.pc_lstm_state_pl_flatten = self.off_lstm_state_pl_flatten
+            self.pc_state_in = self.off_state_in
+            self.pc_a_r_in = self.off_a_r_in
+            self.pc_lstm_state_pl_flatten = self.off_lstm_state_pl_flatten
 
-        # Shared conv and lstm nets, same off-policy batch:
-        pc_x = off_x_lstm_out
+            # Shared conv and lstm nets, same off-policy batch:
+            pc_x = rsh_off_x_lstm_2_out
 
-        # PC duelling Q-network, outputs [None, 20, 20, ac_size] Q-features tensor:
-        self.pc_q = duelling_pc_network(pc_x, self.ac_space, linear_layer_ref=linear_layer_ref, **kwargs)
+            # PC duelling Q-network, outputs [None, 20, 20, ac_size] Q-features tensor:
+            self.pc_q = duelling_pc_network(pc_x, self.ac_space, linear_layer_ref=linear_layer_ref, **kwargs)
 
         # Aux2:
         # `Value function replay` network.
@@ -374,7 +594,8 @@ class StackedLstmPolicy(BaseAacPolicy):
         self.vr_time_length = self.off_time_length
 
         self.vr_state_in = self.off_state_in
-        self.vr_a_r_in = self.off_a_r_in
+        self.vr_last_a_in = self.off_last_a_in
+        self.vr_last_reward_in = self.off_last_reward_in
 
         self.vr_lstm_state_pl_flatten = self.off_lstm_state_pl_flatten
         self.vr_value = self.off_vf
@@ -383,15 +604,48 @@ class StackedLstmPolicy(BaseAacPolicy):
         # `Reward prediction` network.
         self.rp_batch_size = tf.placeholder(tf.int32, name='rp_batch_size')
 
-        # Shared conv. output:
-        rp_x = conv_2d_network(
-            self.rp_state_in['external'],
-            ob_space['external'],
-            ac_space,
-            name='conv1d_external',
-            reuse=True,
-            **kwargs
-        )
+        # Shared encoded output:
+        rp_x = {}
+        for key in self.rp_state_in.keys():
+            if 'external' in key:
+                if isinstance(self.rp_state_in[key], dict):  # got dictionary of data streams
+                    if self.share_encoder_params:
+                        layer_name_template = 'encoded_{}_shared'
+                    else:
+                        layer_name_template = 'encoded_{}_{}'
+                    encoded_streams = {
+                        name: tf.layers.flatten(
+                            self.state_encoder_class_ref(
+                                x=stream,
+                                ob_space=self.ob_space.shape[key][name],
+                                ac_space=self.ac_space,
+                                name=layer_name_template.format(key, name),
+                                reuse=True,  # shared params for all streams in mode
+                                **kwargs
+                            )
+                        )
+                        for name, stream in self.rp_state_in[key].items()
+                    }
+                    encoded_mode = tf.concat(
+                        list(encoded_streams.values()),
+                        axis=-1,
+                        name='multi_encoded_{}'.format(key)
+                    )
+                else:
+                    # Got single data stream:
+                    encoded_mode = tf.layers.flatten(
+                        self.state_encoder_class_ref(
+                            x=self.rp_state_in[key],
+                            ob_space=self.ob_space.shape,
+                            ac_space=self.ac_space,
+                            name='encoded_{}'.format(key),
+                            reuse=True,
+                            **kwargs
+                        )
+                    )
+                rp_x[key] = encoded_mode
+
+        rp_x = tf.concat(list(rp_x.values()), axis=-1, name='rp_state_external_encoded')
 
         # Flatten batch-wise:
         rp_x_shape_static = rp_x.get_shape().as_list()
@@ -400,17 +654,7 @@ class StackedLstmPolicy(BaseAacPolicy):
         # RP output:
         self.rp_logits = dense_rp_network(rp_x, linear_layer_ref=linear_layer_ref)
 
-        # Batch-norm related (useless, ignore):
-        try:
-            if self.train_phase is not None:
-                pass
-
-        except AttributeError:
-            self.train_phase = tf.placeholder_with_default(
-                tf.constant(False, dtype=tf.bool),
-                shape=(),
-                name='train_phase_flag_pl'
-            )
+        # Batch-norm related:
         self.update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
         # Add moving averages to save list:
         moving_var_list = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, tf.get_variable_scope().name + '.*moving.*')
@@ -422,7 +666,13 @@ class StackedLstmPolicy(BaseAacPolicy):
 
         # Callbacks:
         if self.aux_estimate:
-            self.callback['pixel_change'] = self.get_pc_target
+            pass
+            # TEMP DISABLE: due to computation costs
+            # do not use pixel change aux. task; otherwise enable lines 533 - 553 & 640:
+            if False:
+                self.callback['pixel_change'] = self.get_pc_target
+
+        # print('policy_debug_dict:\n', self.debug)
 
 
 class AacStackedRL2Policy(StackedLstmPolicy):
@@ -488,7 +738,6 @@ class AacStackedRL2Policy(StackedLstmPolicy):
             new_context = tuple(new_context)
             # Keep trial number:
             self.current_trial_num = state['metadata']['trial_num']
-
 
         except KeyError:
             raise KeyError(

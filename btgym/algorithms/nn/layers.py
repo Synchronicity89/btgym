@@ -20,15 +20,20 @@ def normalized_columns_initializer(std=1.0):
 #     value = tf.squeeze(tf.multinomial(logits - tf.reduce_max(logits, [1], keepdims=True), 1), [1])
 #     return tf.one_hot(value, d)
 
-def categorical_sample(logits, d):
-    value = tf.squeeze(tf.multinomial(logits, 1), [1])
-    one_hot = tf.one_hot(value, d, name='sample_one_hot')
-    return one_hot
+def categorical_sample(logits, depth):
+    """
+    Given logits returns one-hot encoded categorical sample.
+    Args:
+        logits:
+        depth:
 
-# def categorical_sample(logits, d):  # DET!
-#     value = tf.argmax(logits, axis=-1)
-#     one_hot = tf.one_hot(value, d, name='sample_one_hot')
-#     return one_hot
+    Returns:
+            tensor of shape [batch_dim, logits_depth]
+    """
+    # print('categorical_sample_logits: ', logits)
+    value = tf.squeeze(tf.multinomial(logits, 1), [1])
+    one_hot = tf.one_hot(value, depth, name='sample_one_hot')
+    return one_hot
 
 
 def linear(x, size, name, initializer=None, bias_init=0, reuse=False):
@@ -144,18 +149,6 @@ def conv1d(x, num_filters, name, filter_size=3, stride=2, pad="SAME", dtype=tf.f
         filter_shape = [filter_size, int(x.get_shape()[-1]), num_filters]
 
         # print('filter_shape:', filter_shape)
-
-        # there are "num input feature maps * filter height * filter width"
-        # inputs to each hidden unit
-        fan_in = np.prod(filter_shape[:2])
-
-        # each unit in the lower layer receives a gradient from:
-        # "num output feature maps * filter height * filter width" /
-        #   pooling size
-        fan_out = np.prod(filter_shape[:1]) * num_filters
-
-        # initialize weights with random weights
-        w_bound = np.sqrt(6. / (fan_in + fan_out))
 
         w = tf.get_variable("W", filter_shape, dtype, initializer=tf.contrib.layers.xavier_initializer(),
                             collections=collections)

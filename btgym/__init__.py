@@ -19,15 +19,16 @@
 
 from gym.envs.registration import register
 
+from .spaces import DictSpace, ActionDictSpace
 from .strategy import BTgymBaseStrategy
 from .server import BTgymServer
 from .datafeed import BTgymDataset, BTgymRandomDataDomain, BTgymSequentialDataDomain
 from .datafeed import DataSampleConfig, EnvResetConfig
 from .dataserver import BTgymDataFeedServer
-# from .monitor import BTgymMonitor
 from .rendering import BTgymRendering
-from .spaces import DictSpace
-from .envs.backtrader import BTgymEnv
+from .envs.base import BTgymEnv
+from btgym.envs.multidiscrete import MultiDiscreteEnv
+from btgym.envs.portfolio import PortfolioEnv
 
 register(
     id='backtrader-v0000',

@@ -1,6 +1,6 @@
 ###############################################################################
 #
-# Copyright (C) 2017 Andrew Muzikin
+# Copyright (C) 2017-19 Andrew Muzikin
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -24,7 +24,7 @@ import itertools
 import zmq
 import copy
 
-import time
+import time, datetime
 import random
 from datetime import timedelta
 
@@ -49,9 +49,19 @@ class _BTgymAnalyzer(bt.Analyzer):
         # Inherit logger and ZMQ socket from parent:
         self.log = self.strategy.env._log
         self.socket = self.strategy.env._socket
+        self.data_socket = self.strategy.env._data_socket
         self.render = self.strategy.env._render
+
+        # Pass data serving methods:
+        self.get_current_trial = self.strategy.env._get_data
+        self.can_broadcast = self.strategy.can_broadcast
+        self.get_timestamp = self.strategy._get_timestamp
+        self.get_dataset_info = self.strategy.env._get_info
+        self.get_broadcast_info = self.strategy._get_broadcast_info
+
         self.message = None
-        self.step_to_render = None # Due to reset(), this will get populated before first render() call.
+        self.step_to_render = None  # Due to reset(), this will get populated before first render() call.
+        self.respond_pending = False
 
         # At the end of the episode - render everything but episode:
         self.render_at_stop = self.render.render_modes.copy()
@@ -81,6 +91,46 @@ class _BTgymAnalyzer(bt.Analyzer):
         self.strategy.close()
         self.strategy.env.runstop()
 
+    def send_env_response(self, is_done):
+        """
+        Sends environment response as <o, r, d, i> tuple.
+        See issue #84.
+        """
+        # Gather response:
+        raw_state = self.strategy.get_raw_state()
+        state = self.strategy.get_state()
+        reward = self.strategy.get_reward()
+        # Send response as <o, r, d, i> tuple (Gym convention),
+        # opt to send entire info_list or just latest part:
+        info = [self.info_list[-1]]
+        self.socket.send_pyobj((state, reward, is_done, info))
+
+        # Increment global time by sending timestamp to data_server, if authorized;
+        if self.can_broadcast:
+            global_timestamp = self.get_timestamp()
+            broadcast_info = self.get_broadcast_info()
+            self.log.debug('broadcasting timestamp: {}'.format(global_timestamp))
+
+            self.data_socket.send_pyobj(
+                {
+                    'ctrl': '_set_broadcast_message',
+                    'timestamp': global_timestamp,
+                    'broadcast_message': broadcast_info,
+                }
+            )
+            broadcast_set_response = self.data_socket.recv_pyobj()
+            self.log.debug('DATA_COMM/broadcast received: {}'.format(broadcast_set_response))
+
+        # Back up step information for rendering.
+        # It pays when using skip-frames: will'll get future state otherwise.
+
+        self.step_to_render = ({'human': raw_state}, state, reward, is_done, self.info_list)
+
+        # Reset info:
+        self.info_list = []
+        self.strategy.env_iteration += 1
+        self.respond_pending = False
+
     def next(self):
         """
         Actual env.step() communication and episode termination is here.
@@ -91,24 +141,27 @@ class _BTgymAnalyzer(bt.Analyzer):
         # Collect step info:
         self.info_list.append(self.strategy.get_info())
         # Put agent on hold:
-        self.strategy.action = 'hold'
+        self.strategy.action = self.strategy.p.initial_portfolio_action
+        # Trick to avoid excessive orders emitting during skip_frame loop:
+        self.strategy.action['_skip_this'] = True
 
         # Only if it's time to communicate or episode has come to end:
         if self.strategy.iteration % self.strategy.p.skip_frame == 0 or is_done:
+            if self.respond_pending:
+                # Other side is waiting for response:
+                self.send_env_response(is_done)
+
+                # If done, initiate fallback to Control Mode:
+                if is_done:
+                    self.early_stop()
+                    return
 
             #print('Analyzer_strat_iteration:', self.strategy.iteration)
             #print('Analyzer_env_iteration:', self.strategy.env_iteration)
 
-            # Gather response:
-            raw_state = self.strategy._get_raw_state()
-            state = self.strategy.get_state()
-            # DUMMY:
-
-            reward = self.strategy.get_reward()
-
             # Halt and wait to receive message from outer world:
             self.message = self.socket.recv_pyobj()
-            msg = 'COMM recieved: {}'.format(self.message)
+            msg = 'COMM received: {}'.format(self.message)
             self.log.debug(msg)
 
             # Control actions loop, ignoring 'action' key:
@@ -122,39 +175,41 @@ class _BTgymAnalyzer(bt.Analyzer):
                         )
                     )
                 # Episode termination requested:
-                if self.message['ctrl'] == '_done':
+                elif self.message['ctrl'] == '_done':
                     is_done = True  # redundant
                     self.socket.send_pyobj('_DONE SIGNAL RECEIVED')
                     self.early_stop()
                     return None
+
+                elif self.message['ctrl'] == '_get_data':
+                    self.socket.send_pyobj(self.get_current_trial())
+
+                elif self.message['ctrl'] == '_get_info':
+                    self.socket.send_pyobj(self.get_dataset_info())
+
+                # Unknown key:
+                else:
+                    message = {'ctrl': 'send control keys: <_reset>, <_getstat>, ' +
+                                       '<_render>, <_stop>, or valid agent action'}
+                    self.log.warning(
+                        'Analyzer received unexpected key: {}; Sent: {}'.format(self.message, str(message))
+                    )
+                    self.socket.send_pyobj(message)
 
                 # Halt again:
                 self.message = self.socket.recv_pyobj()
                 msg = 'COMM recieved: {}'.format(self.message)
                 self.log.debug(msg)
 
-            # Store agent action:
-            if 'action' in self.message: # now it should!
+            # Store agent action an rise respond_pending flag:
+            if 'action' in self.message:  # now it should!
                 self.strategy.action = self.message['action']
                 self.strategy.last_action = self.message['action']
+                self.respond_pending = True
 
             else:
                 msg = 'No <action> key recieved:\n' + msg
                 raise AssertionError(msg)
-
-            # Send response as <o, r, d, i> tuple (Gym convention),
-            # opt to send entire info_list or just latest part:
-            info = [self.info_list[-1]]
-            self.socket.send_pyobj((state, reward, is_done, info))
-
-            # Back up step information for rendering.
-            # It pays when using skip-frames: will'll get future state otherwise.
-
-            self.step_to_render = ({'human':raw_state}, state, reward, is_done, self.info_list)
-
-            # Reset info:
-            self.info_list = []
-            self.strategy.env_iteration += 1
 
         # If done, initiate fallback to Control Mode:
         if is_done:
@@ -235,6 +290,10 @@ class BTgymServer(multiprocessing.Process):
         self.connect_timeout = connect_timeout # server connection timeout in seconds.
         self.connect_timeout_step = 0.01
 
+        self.trial_sample = None
+        self.trial_stat = None
+        self.dataset_stat = None
+
     @staticmethod
     def _comm_with_timeout(socket, message):
         """
@@ -278,7 +337,24 @@ class BTgymServer(multiprocessing.Process):
 
         return response
 
-    def get_data(self, **reset_kwargs):
+    def get_dataset_stat(self):
+        data_server_response = self._comm_with_timeout(
+            socket=self.data_socket,
+            message={'ctrl': '_get_info'}
+        )
+        if data_server_response['status'] in 'ok':
+            self.log.debug('Data_server @{} responded with dataset statistic in about {} seconds.'.
+                           format(self.data_network_address, data_server_response['time']))
+
+            return data_server_response['message']
+
+        else:
+            msg = 'BtgymServer_sampling_attempt: data_server @{} unreachable with status: <{}>.'. \
+                format(self.data_network_address, data_server_response['status'])
+            self.log.error(msg)
+            raise ConnectionError(msg)
+
+    def get_trial(self, **reset_kwargs):
         """
 
         Args:
@@ -295,12 +371,12 @@ class BTgymServer(multiprocessing.Process):
                 message={'ctrl': '_get_data', 'kwargs': reset_kwargs}
             )
             if data_server_response['status'] in 'ok':
-                self.log.debug('Data_server responded with data in about {} seconds.'.
-                               format(data_server_response['time']))
+                self.log.debug('Data_server @{} responded in ~{:1.6f} seconds.'.
+                               format(self.data_network_address, data_server_response['time']))
 
             else:
-                msg = 'BtgymServer_sampling_attempt: data_server unreachable with status: <{}>.'. \
-                    format(data_server_response['status'])
+                msg = 'BtgymServer_sampling_attempt: data_server @{} unreachable with status: <{}>.'. \
+                    format(self.data_network_address, data_server_response['status'])
                 self.log.error(msg)
                 raise ConnectionError(msg)
 
@@ -330,8 +406,77 @@ class BTgymServer(multiprocessing.Process):
         trial_stat = trial_sample.describe()
         trial_sample.reset()
         dataset_stat = data_server_response['message']['stat']
+        origin = data_server_response['message']['origin']
+        timestamp = data_server_response['message']['timestamp']
 
-        return trial_sample, trial_stat, dataset_stat
+        return trial_sample, trial_stat, dataset_stat, origin, timestamp
+
+    def get_trial_message(self):
+        """
+        Prepares  message containing current trial instance, mimicking data_server message protocol.
+        Intended for serving requests from data_slave environment.
+
+        Returns:
+            dict containing trial instance, d_set statistic and origin key; dict containing 'ctrl' response if master
+            d_set is not ready;
+        """
+        if self.trial_sample is not None:
+            message = {
+                'sample': self.trial_sample,
+                'stat': self.dataset_stat,
+                'origin': 'master_environment',
+                'timestamp': self.get_global_time()
+            }
+
+        else:
+            message = {'ctrl': 'Dataset not ready, hold on...'}
+            self.log.debug('Sent to slave: ' + str(message))
+
+        return message
+
+    def get_global_time(self):
+        """
+        Asks dataserver for current dataset global_time.
+
+        Returns:
+            POSIX timestamp
+        """
+        data_server_response = self._comm_with_timeout(
+            socket=self.data_socket,
+            message={'ctrl': '_get_global_time'}
+        )
+        if data_server_response['status'] in 'ok':
+            pass
+
+        else:
+            msg = 'BtgymServer_sampling_attempt: data_server @{} unreachable with status: <{}>.'. \
+                format(self.data_network_address, data_server_response['status'])
+            self.log.error(msg)
+            raise ConnectionError(msg)
+
+        return data_server_response['message']['timestamp']
+
+    def get_broadcast_message(self):
+        """
+        Asks dataserver for current dataset global_time and broadcast message.
+
+        Returns:
+            POSIX timestamp
+        """
+        data_server_response = self._comm_with_timeout(
+            socket=self.data_socket,
+            message={'ctrl': '_get_broadcast_message'}
+        )
+        if data_server_response['status'] in 'ok':
+            pass
+
+        else:
+            msg = 'BtgymServer_sampling_attempt: data_server @{} unreachable with status: <{}>.'. \
+                format(self.data_network_address, data_server_response['status'])
+            self.log.error(msg)
+            raise ConnectionError(msg)
+
+        return data_server_response['message']['timestamp'], data_server_response['message']['broadcast_message']
 
     def run(self):
         """
@@ -352,9 +497,6 @@ class BTgymServer(multiprocessing.Process):
         cerebro = None
         episode_result = dict()
         episode_sample = None
-        trial_sample = None
-        trial_stat = None
-        dataset_stat = None
 
         # How long to wait for data_master to reset data:
         self.wait_for_data_reset = 300  # seconds
@@ -396,7 +538,7 @@ class BTgymServer(multiprocessing.Process):
         # Init renderer:
         self.render.initialize_pyplot()
 
-        # Mandatory DrawDown and auxillary plotting observers to add to data-master startegy instance:
+        # Mandatory DrawDown and auxillary plotting observers to add to data-master strategy instance:
         # TODO: make plotters optional args
         if self.render.enabled:
             aux_obsrevers = [bt.observers.DrawDown, Reward, Position, NormPnL]
@@ -439,8 +581,20 @@ class BTgymServer(multiprocessing.Process):
                     # Send episode rendering:
                     elif service_input['ctrl'] == '_render' and 'mode' in service_input.keys():
                         # Just send what we got:
-                        self.socket.send_pyobj(self.render.render(service_input['mode'],))
+                        self.socket.send_pyobj(self.render.render(service_input['mode']))
                         self.log.debug('Episode rendering for [{}] sent.'.format(service_input['mode']))
+
+                    # Serve data-dependent environment with trial instance:
+                    elif service_input['ctrl'] == '_get_data':
+                        message = 'Sending trial data to slave'
+                        self.log.debug(message)
+                        self.socket.send_pyobj(self.get_trial_message())
+
+                    # Serve data-dependent environment with dataset statisitc:
+                    elif service_input['ctrl'] == '_get_info':
+                        message = 'Sending dataset statistic to slave'
+                        self.log.debug(message)
+                        self.socket.send_pyobj(self.get_dataset_stat())
 
                     else:  # ignore any other input
                         # NOTE: response string must include 'ctrl' key
@@ -458,8 +612,13 @@ class BTgymServer(multiprocessing.Process):
             start_time = time.time()
             cerebro = copy.deepcopy(self.cerebro)
             cerebro._socket = self.socket
+            cerebro._data_socket = self.data_socket
             cerebro._log = self.log
             cerebro._render = self.render
+
+            # Pass methods for serving capabilities:
+            cerebro._get_data = self.get_trial_message
+            cerebro._get_info = self.get_dataset_stat
 
             # Add auxillary observers, if not already:
             for aux in aux_obsrevers:
@@ -474,6 +633,10 @@ class BTgymServer(multiprocessing.Process):
             cerebro.addanalyzer(_BTgymAnalyzer, _name='_env_analyzer',)
 
             # Data preparation:
+
+            # Renew system state:
+            current_timestamp, current_broadcast_message = self.get_broadcast_message()
+
             # Parse args we got with _reset call:
             sample_config = dict(
                 episode_config=copy.deepcopy(DataSampleConfig),
@@ -487,40 +650,69 @@ class BTgymServer(multiprocessing.Process):
                     self.log.debug(
                         '_reset <{}> kwarg not found, using default values: {}'.format(key, config)
                     )
+            sample_config['trial_config']['broadcast_message'] = current_broadcast_message
+            sample_config['episode_config']['broadcast_message'] = current_broadcast_message
 
             # Get new Trial from data_server if requested,
             # despite bult-in new/reuse data object sampling option, perform checks here to avoid
             # redundant traffic:
-            if sample_config['trial_config']['get_new'] or trial_sample is None:
-                self.log.debug(
+            if sample_config['trial_config']['get_new'] or self.trial_sample is None:
+                self.log.info(
                     'Requesting new Trial sample with args: {}'.format(sample_config['trial_config'])
                 )
-                trial_sample, trial_stat, dataset_stat = self.get_data(**sample_config['trial_config'])
-                trial_sample.set_logger(self.log_level, self.task)
-                self.log.debug('Got new Trial: <{}>'.format(trial_sample.filename))
+                self.trial_sample, self.trial_stat, self.dataset_stat, origin, current_timestamp =\
+                    self.get_trial(**sample_config['trial_config'])
+
+                if origin in 'data_server':
+                    self.trial_sample.set_logger(self.log_level, self.task)
+
+                self.log.debug('Got new Trial: <{}>'.format(self.trial_sample.filename))
 
             else:
-                self.log.debug('Reusing Trial <{}>'.format(trial_sample.filename))
+                self.log.info('Reusing Trial <{}>'.format(self.trial_sample.filename))
+                # current_timestamp = self.get_global_time()
 
+            self.log.debug(
+                'current global_time: {}'.format(datetime.datetime.fromtimestamp(current_timestamp))
+            )
             # Get episode:
-            self.log.debug('Requesting episode from <{}>'.format(trial_sample.filename))
-            episode_sample = trial_sample.sample(**sample_config['episode_config'])
+            if sample_config['episode_config']['timestamp'] is None or\
+                    sample_config['episode_config']['timestamp'] < current_timestamp:
+                sample_config['episode_config']['timestamp'] = current_timestamp
+
+            self.log.info(
+                'Requesting episode from <{}> with args: {}'.
+                format(self.trial_sample.filename, sample_config['episode_config'])
+            )
+
+            episode_sample = self.trial_sample.sample(**sample_config['episode_config'])
+            self.log.debug('Got new Episode: <{}>'.format(episode_sample.filename))
 
             # Get episode data statistic and pass it to strategy params:
-            cerebro.strats[0][0][2]['trial_stat'] = trial_stat
-            cerebro.strats[0][0][2]['trial_metadata'] = trial_sample.metadata
-            cerebro.strats[0][0][2]['dataset_stat'] = dataset_stat
+            cerebro.strats[0][0][2]['trial_stat'] = self.trial_stat
+            cerebro.strats[0][0][2]['trial_metadata'] = self.trial_sample.metadata
+            cerebro.strats[0][0][2]['dataset_stat'] = self.dataset_stat
             cerebro.strats[0][0][2]['episode_stat'] = episode_sample.describe()
             cerebro.strats[0][0][2]['metadata'] = episode_sample.metadata
+
+            cerebro.strats[0][0][2]['broadcast_message'] = current_broadcast_message
 
             # Set nice broker cash plotting:
             cerebro.broker.set_shortcash(False)
 
             # Convert and add data to engine:
-            cerebro.adddata(episode_sample.to_btfeed())
+            feed = episode_sample.to_btfeed()
+            if isinstance(feed, dict):
+                for key, stream in feed.items():
+                    cerebro.adddata(stream, name=key)
+
+            else:
+                cerebro.adddata(feed, name='base_asset')
 
             # Finally:
-            episode = cerebro.run(stdstats=True, preload=False, oldbuysell=True)[0]
+            episode = cerebro.run(stdstats=True, preload=False, oldbuysell=True, tradehistory=True)[0]
+
+            self.log.debug('Episode run finished.')
 
             # Update episode rendering:
             _ = self.render.render('just_render', cerebro=cerebro)

@@ -20,6 +20,7 @@
 import multiprocessing
 import copy
 import zmq
+import datetime
 
 from .datafeed import DataSampleConfig
 
@@ -28,6 +29,7 @@ class BTgymDataFeedServer(multiprocessing.Process):
     """
     Data provider server class.
     Enables efficient data sampling for asynchronous multiply BTgym environments execution.
+    Manages global back-testing time and broadcast messages.
     """
     process = None
     dataset_stat = None
@@ -50,16 +52,18 @@ class BTgymDataFeedServer(multiprocessing.Process):
         self.local_step = 0
         self.dataset = dataset
         self.network_address = network_address
-        self.pre_sample = None
-        self.pre_sample_config = copy.deepcopy(DataSampleConfig)
+        self.default_sample_config = copy.deepcopy(DataSampleConfig)
+        self.broadcast_message = None
 
         self.debug_pre_sample_fails = 0
         self.debug_pre_sample_attempts = 0
 
+        # self.global_timestamp = 0
+
     def get_data(self, sample_config=None):
         """
         Get Trial sample according to parameters received.
-        If no parameters being passed - just makes and stores pre-sample.
+        If no parameters being passed - makes sample with default parameters.
 
         Args:
             sample_config:   sampling parameters configuration dictionary
@@ -67,52 +71,32 @@ class BTgymDataFeedServer(multiprocessing.Process):
         Returns:
             sample:     if `sample_params` arg has been passed and dataset is ready
             None:       otherwise
-
-        Notes:
-            Some heuristic used here to enable parallelism: as training usually requires long series of similar samples,
-            we pre-sample data with most probable parameters;
-            first guessed sample gets type =`Train`, b_alpha=1, b_beta=1, and subsequent ones get actual
-            sampling params of previous accepted sample. If newly received parameters doesnt match pre-sampled ones -
-            we discard our guess and sample again with actual params.
-            TODO: should be switched off if using decaying `b_alpha` and `b_beta` params.
         """
         if self.dataset.is_ready:
             if sample_config is not None:
-                if self.pre_sample is None or not self.pre_sample_config == sample_config:
-                    self.log.debug('Pre-sampling guess failed, resampling.')
-                    self.pre_sample_config = copy.deepcopy(sample_config)
-                    sample = self.dataset.sample(**sample_config)
+                # We do not allow configuration timestamps which point earlier than current global_timestamp;
+                # if config timestamp points later - it is ok because global time will be shifted accordingly after
+                # [traget test] sample will get into work.
+                if sample_config['timestamp'] is None:
+                    sample_config['timestamp'] = 0
 
-                    self.debug_pre_sample_fails += 1
+                # If config timestamp is outdated - refresh with latest:
+                if sample_config['timestamp'] < self.dataset.global_timestamp:
+                    sample_config['timestamp'] = copy.deepcopy(self.dataset.global_timestamp)
 
-                else:
-                    self.log.debug('Pre-sampling guess succeeded.')
-                    sample = self.pre_sample
+                self.log.debug('Sampling with params: {}'.format(sample_config))
+                sample = self.dataset.sample(**sample_config)
 
             else:
-                self.log.debug('Guessing sample with params: {}'.format(self.pre_sample_config))
-                self.pre_sample = self.dataset.sample(**self.pre_sample_config)
-
-                self.debug_pre_sample_attempts += 1
-
-                return None
+                self.default_sample_config['timestamp'] = copy.deepcopy(self.dataset.global_timestamp)
+                self.log.debug('Sampling with default params: {}'.format(self.default_sample_config))
+                sample = self.dataset.sample(**self.default_sample_config)
 
             self.local_step += 1
 
-            # Debug:
-            if self.local_step % 100 == 0:
-                self.log.debug(
-                    'Pre_samples: {}, failed: {}, fails/attempts: {}'.
-                        format(
-                        self.debug_pre_sample_attempts,
-                        self.debug_pre_sample_fails,
-                        self.debug_pre_sample_fails / (self.debug_pre_sample_attempts + 1e-10)
-                    )
-                )
         else:
             # Dataset not ready, make dummy:
             sample = None
-            self.pre_sample = None
 
         return sample
 
@@ -147,15 +131,8 @@ class BTgymDataFeedServer(multiprocessing.Process):
         self.dataset_stat = self.dataset.describe()
 
         # Main loop:
-        get_new = True
-
         while True:
-            if get_new:
-            # Guess sample:
-                self.get_data()
-                get_new = False
-
-            # Stick here with data in hand until receive any request:
+            # Stick here until receive any request:
             service_input = socket.recv_pyobj()
             self.log.debug('Received <{}>'.format(service_input))
 
@@ -180,21 +157,33 @@ class BTgymDataFeedServer(multiprocessing.Process):
                         kwargs = {}
 
                     self.dataset.reset(**kwargs)
+                    # self.global_timestamp = self.dataset.global_timestamp
+                    self.log.notice(
+                        'Initial global_time set to: {} / stamp: {}'.
+                        format(
+                            datetime.datetime.fromtimestamp(self.dataset.global_timestamp),
+                            self.dataset.global_timestamp
+                        )
+                    )
                     message = {'ctrl': 'Reset with kwargs: {}'.format(kwargs)}
                     self.log.debug('Data_is_ready: {}'.format(self.dataset.is_ready))
                     socket.send_pyobj(message)
                     self.local_step = 0
-                    get_new = True
 
                 # Send dataset sample:
                 elif service_input['ctrl'] == '_get_data':
                     if self.dataset.is_ready:
-                        # Call _get_data to verify sampling guess or resample:
                         sample = self.get_data(sample_config=service_input['kwargs'])
                         message = 'Sending sample_#{}.'.format(self.local_step)
                         self.log.debug(message)
-                        socket.send_pyobj({'sample': sample, 'stat': self.dataset_stat})
-                        get_new = True
+                        socket.send_pyobj(
+                            {
+                                'sample': sample,
+                                'stat': self.dataset_stat,
+                                'origin': 'data_server',
+                                'timestamp': self.dataset.global_timestamp,
+                            }
+                        )
 
                     else:
                         message = {'ctrl': 'Dataset not ready, waiting for control key <_reset_data>'}
@@ -210,17 +199,58 @@ class BTgymDataFeedServer(multiprocessing.Process):
                         dataset_stat=self.dataset_stat,
                         dataset_columns=list(self.dataset.names),
                         pid=self.process.pid,
-                        dataset_is_ready=self.dataset.is_ready
+                        dataset_is_ready=self.dataset.is_ready,
+                        data_names=self.dataset.data_names
                     )
                     socket.send_pyobj(info_dict)
 
+                # Set global time:
+                elif service_input['ctrl'] == '_set_broadcast_message':
+                    if self.dataset.global_timestamp != 0 and self.dataset.global_timestamp > service_input['timestamp']:
+                        message = 'Moving back in time not supported! ' +\
+                                  'Current global_time: {}, '.\
+                                      format(datetime.datetime.fromtimestamp(self.dataset.global_timestamp)) +\
+                                  'attempt to set: {}; global_time and broadcast message not set.'.\
+                                      format(datetime.datetime.fromtimestamp(service_input['timestamp'])) +\
+                                  'Hint: check sampling logic consistency.'
+
+                        self.log.info(message)
+
+                    else:
+                        self.dataset.global_timestamp = service_input['timestamp']
+                        self.broadcast_message = service_input['broadcast_message']
+                        message = 'global_time set to: {} / stamp: {}'.\
+                            format(
+                                datetime.datetime.fromtimestamp(self.dataset.global_timestamp),
+                                self.dataset.global_timestamp
+                            )
+                    socket.send_pyobj(message)
+                    self.log.debug(message)
+
+                elif service_input['ctrl'] == '_get_global_time':
+                    # Tell time:
+                    message = {'timestamp': self.dataset.global_timestamp}
+                    socket.send_pyobj(message)
+
+                elif service_input['ctrl'] == '_get_broadcast_message':
+                    # Tell:
+                    message = {
+                        'timestamp': self.dataset.global_timestamp,
+                        'broadcast_message': self.broadcast_message,
+                    }
+                    socket.send_pyobj(message)
+
                 else:  # ignore any other input
                     # NOTE: response dictionary must include 'ctrl' key
-                    message = {'ctrl': 'waiting for control keys:  <_reset_data>, <_get_data>, <_get_info>, <_stop>.'}
+                    message = {
+                        'ctrl':
+                            'waiting for control keys:  <_reset_data>, <_get_data>, ' +
+                            '<_get_info>, <_stop>, <_get_global_time>, <_get_broadcast_message>'
+                    }
                     self.log.debug('Sent: ' + str(message))
                     socket.send_pyobj(message)  # pairs any other input
 
             else:
-                message = {'ctrl': 'No <ctrl> key received, got:\n{}'.format(msg)}
+                message = {'ctrl': 'No <ctrl> key received, got:\n{}'.format(service_input)}
                 self.log.debug(str(message))
                 socket.send_pyobj(message) # pairs input

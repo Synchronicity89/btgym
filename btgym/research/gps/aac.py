@@ -2,7 +2,7 @@ import tensorflow as tf
 
 from btgym.algorithms import BaseAAC
 from .loss import guided_aac_loss_def_0_0, guided_aac_loss_def_0_1, guided_aac_loss_def_0_3
-from btgym.research.verbose_env_runner import VerboseEnvRunnerFn
+from btgym.algorithms.runner.synchro import BaseSynchroRunner, VerboseSynchroRunner
 
 
 class GuidedAAC(BaseAAC):
@@ -37,9 +37,11 @@ class GuidedAAC(BaseAAC):
             expert_loss=guided_aac_loss_def_0_3,
             aac_lambda=1.0,
             guided_lambda=1.0,
-            runner_fn_ref=VerboseEnvRunnerFn,
-            _aux_render_modes=('action_prob', 'value_fn', 'lstm_1_h', 'lstm_2_h'),
-            _log_name='GuidedA3C',
+            guided_decay_steps=None,
+            runner_config=None,
+            # aux_render_modes=('action_prob', 'value_fn', 'lstm_1_h', 'lstm_2_h'),
+            aux_render_modes=None,
+            name='GuidedA3C',
             **kwargs
     ):
         """
@@ -48,43 +50,101 @@ class GuidedAAC(BaseAAC):
             expert_loss:        callable returning tensor holding on_policy imitation loss graph and summaries
             aac_lambda:         float, main on_policy a3c loss lambda
             guided_lambda:      float, imitation loss lambda
-            _log_name:          str, class-wide logger name; internal, do not use
+            guided_decay_steps: number of steps guided_lambda is annealed to zero
+            name:               str, name scope
             **kwargs:           see BaseAAC kwargs
         """
         try:
+            self.expert_loss = expert_loss
+            self.aac_lambda = aac_lambda
+            self.guided_lambda = guided_lambda * 1.0
+            self.guided_decay_steps = guided_decay_steps
+            self.guided_lambda_decayed = None
+            self.train_guided_lambda = None
+            if runner_config is None:
+                runner_config = {
+                    'class_ref': BaseSynchroRunner,
+                    'kwargs': {
+                        'aux_render_modes': aux_render_modes,  # ('action_prob', 'value_fn', 'lstm_1_h', 'lstm_2_h'),
+                    }
+                }
+
             super(GuidedAAC, self).__init__(
-                runner_fn_ref=runner_fn_ref,
-                _aux_render_modes=_aux_render_modes,
-                _log_name=_log_name,
+                runner_config=runner_config,
+                name=name,
+                aux_render_modes=aux_render_modes,
                 **kwargs
             )
-            with tf.device(self.worker_device):
-                with tf.variable_scope('local'):
-                    guided_loss_ext, guided_summary_ext = expert_loss(
-                        pi_actions=self.local_network.on_logits,
-                        expert_actions=self.local_network.expert_actions,
-                        name='on_policy',
-                        verbose=True
-                    )
-                    self.loss = aac_lambda * self.loss + guided_lambda * guided_loss_ext
-
-                    self.log.notice('aac_lambda: {:1.6f}, guided_lambda: {:1.6f}'.format(aac_lambda, guided_lambda))
-
-                    # Override train op def:
-                    self.grads, _ = tf.clip_by_global_norm(
-                        tf.gradients(self.loss, self.local_network.var_list),
-                        40.0
-                    )
-                    grads_and_vars = list(zip(self.grads, self.network.var_list))
-                    self.train_op = self.optimizer.apply_gradients(grads_and_vars)
-
-                # Merge summary:
-                extended_summary = [guided_summary_ext, tf.summary.scalar("gps_total_loss", self.loss)]
-                extended_summary.append(self.model_summary_op)
-                self.model_summary_op = tf.summary.merge(extended_summary, name='gps_extended_summary')
-
         except:
-            msg = 'Child 0.0 class __init()__ exception occurred' + \
+            msg = 'GuidedAAC.__init()__ exception occurred' + \
                   '\n\nPress `Ctrl-C` or jupyter:[Kernel]->[Interrupt] for clean exit.\n'
             self.log.exception(msg)
             raise RuntimeError(msg)
+
+    def _make_loss(self, **kwargs):
+        """
+        Augments base loss with expert actions imitation loss
+
+        Returns:
+            tensor holding estimated loss graph
+            list of related summaries
+        """
+        aac_loss, summaries = self._make_base_loss(**kwargs)
+
+        # Guidance annealing:
+        if self.guided_decay_steps is not None:
+            self.guided_lambda_decayed = tf.train.polynomial_decay(
+                self.guided_lambda,
+                self.global_step + 1,
+                self.guided_decay_steps,
+                0.0,
+                power=1,
+                cycle=False,
+            )
+        else:
+            self.guided_lambda_decayed = self.guided_lambda
+        # Switch to zero when testing - prevents information leakage:
+        self.train_guided_lambda = self.guided_lambda_decayed * tf.cast(self.local_network.train_phase, tf.float32)
+
+        self.guided_loss, guided_summary = self.expert_loss(
+            pi_actions=self.local_network.on_logits,
+            expert_actions=self.local_network.expert_actions,
+            name='on_policy',
+            verbose=True,
+            guided_lambda=self.train_guided_lambda
+        )
+        loss = self.aac_lambda * aac_loss + self.guided_loss
+
+        summaries += guided_summary
+
+        self.log.notice(
+            'guided_lambda: {:1.6f}, guided_decay_steps: {}'.format(self.guided_lambda, self.guided_decay_steps)
+        )
+
+        return loss, summaries
+
+
+class VerboseGuidedAAC(GuidedAAC):
+    """
+    Extends parent `GuidedAAC` class with additional summaries.
+    """
+
+    def __init__(
+            self,
+            runner_config=None,
+            aux_render_modes=('action_prob', 'value_fn', 'lstm_1_h', 'lstm_2_h'),
+            name='VerboseGuidedA3C',
+            **kwargs
+    ):
+        super(VerboseGuidedAAC, self).__init__(
+            name=name,
+            runner_config={
+                    'class_ref': VerboseSynchroRunner,
+                    'kwargs': {
+                        'aux_render_modes': aux_render_modes,
+                    }
+                },
+            aux_render_modes=aux_render_modes,
+            **kwargs
+        )
+
